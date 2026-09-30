@@ -8,7 +8,7 @@
     revision: null,
     locked: false,
     doc: null,                 // {fabric, defects:[{id,name,points}], pieces:[...], placements:[...]}
-    mode: 'setup',             // setup | layout
+    mode: 'setup',             // setup | layout | cutlist | plans
     dirty: false,
     conflicts: null,           // 最近一次保存被拒返回的冲突
     selectedId: null,
@@ -18,7 +18,13 @@
     spaceDown: false,
     dragging: null,
     panning: null,
-    hoverId: null
+    hoverId: null,
+    // —— 命名试排方案 ——
+    ctx: 'board',              // board=正在编辑正式版图 | plan=正在编辑某份试排方案
+    planId: null,
+    planName: null,
+    sourceRevision: null,     // 方案所依据的正式版图修订号
+    boardInfo: null           // 正式版图最新状态 {revision, locked}
   };
 
   var PIECE_COLORS = ['#2563eb', '#0d9488', '#7c3aed', '#db2777', '#ea580c', '#4d7c0f', '#0891b2', '#a16207'];
@@ -63,8 +69,13 @@
     });
   }
   function applyServerRow(row) {
+    state.ctx = 'board';
+    state.planId = null;
+    state.planName = null;
+    state.sourceRevision = null;
     state.revision = row.revision;
     state.locked = row.locked;
+    state.boardInfo = { revision: row.revision, locked: row.locked, updatedAt: row.updatedAt };
     state.doc = row.doc;
     state.dirty = false;
     state.conflicts = null;
@@ -72,6 +83,36 @@
       state.selectedId = null;
     }
     renderAll();
+  }
+
+  function applyPlan(payload, opts) {
+    var plan = payload.plan;
+    state.ctx = 'plan';
+    state.planId = plan.id;
+    state.planName = plan.name;
+    state.sourceRevision = plan.sourceRevision;
+    state.revision = plan.revision;
+    state.locked = false; // 试排方案没有“锁定”概念
+    if (payload.board) state.boardInfo = { revision: payload.board.revision, locked: payload.board.locked };
+    state.doc = plan.doc;
+    state.dirty = false;
+    state.conflicts = null;
+    state.selectedId = null;
+    renderAll();
+    if (opts && opts.fit) fitView();
+  }
+
+  function openPlan(id, opts) {
+    return api('GET', '/api/plans/' + encodeURIComponent(id)).then(function (r) {
+      if (r.status !== 200) { alert('打开方案失败：' + (r.d.message || r.status)); return; }
+      applyPlan(r.d, opts);
+    });
+  }
+
+  function backToBoard() {
+    if (state.ctx === 'plan' && state.dirty &&
+        !confirm('当前方案有未保存改动，确定放弃并返回正式版图？')) return;
+    loadBoard().then(function () { fitView(); });
   }
 
   function markDirty() {
@@ -572,6 +613,11 @@
   }
 
   /* ================= 保存 / 锁定 ================= */
+  function saveCurrent() {
+    if (state.ctx === 'plan') savePlan();
+    else saveBoard();
+  }
+
   function saveBoard() {
     if (state.locked) { alert('版图已锁定，禁止改动'); return; }
     // 先在本地做一次快速结构校验（服务端是唯一权威）
@@ -609,7 +655,44 @@
     }).catch(function (err) { alert('网络错误：' + err.message); });
   }
 
+  function savePlan() {
+    var local = validateLocally();
+    if (local.length) {
+      state.conflicts = local;
+      renderConflicts(); draw();
+      alert('本地检查未通过，未提交服务器：\n\n' + local.map(function (c) { return '· ' + c.message; }).join('\n'));
+      return;
+    }
+    $('saveState').textContent = '保存方案中…';
+    api('PUT', '/api/plans/' + encodeURIComponent(state.planId), { revision: state.revision, doc: state.doc })
+      .then(function (r) {
+        if (r.status === 200) {
+          // 用返回的方案（含服务端规整后的 doc）替换本地状态，但保持在方案上下文
+          var board = state.boardInfo;
+          applyPlan(r.d, null);
+          if (board) state.boardInfo = board;
+          renderChrome();
+          flash('✓ 方案「' + r.d.plan.name + '」已保存，方案修订号 ' + r.d.revision);
+        } else if (r.status === 422) {
+          state.conflicts = r.d.conflicts;
+          renderConflicts(); renderSidebar(); draw();
+        } else if (r.status === 409) {
+          if (confirm('方案修订号 ' + state.revision + ' 已过期，他人已将方案保存到修订号 ' +
+            r.d.current.revision + '。\n\n确定放弃本地未保存改动并载入最新方案吗？\n（选“取消”可先自行备份）')) {
+            if (r.d.board) state.boardInfo = { revision: r.d.board.revision, locked: r.d.board.locked };
+            applyPlan(r.d, { fit: true });
+          }
+        } else if (r.status === 404) {
+          alert('方案已被删除，即将返回正式版图。');
+          loadBoard().then(fitView);
+        } else {
+          alert('保存方案失败：' + (r.d.message || r.status));
+        }
+      }).catch(function (err) { alert('网络错误：' + err.message); });
+  }
+
   function lockBoard() {
+    if (state.ctx === 'plan') { alert('试排方案不能锁定；请先转回正式版图。'); return; }
     if (state.locked) return;
     // 若有未排数量，明确提示（仍允许锁定，清单会保留未排数）
     var pending = [];
@@ -633,6 +716,182 @@
       } else if (r.status === 423) { loadBoard(); }
       else alert('锁定失败：' + (r.d.message || r.status));
     });
+  }
+
+  /* ================= 命名试排方案管理 ================= */
+  function loadPlans() {
+    return api('GET', '/api/plans').then(function (r) {
+      if (r.status !== 200) throw new Error(r.d.message || '读取方案列表失败');
+      if (r.d.board) state.boardInfo = { revision: r.d.board.revision, locked: r.d.board.locked, updatedAt: r.d.board.updatedAt };
+      return r.d;
+    });
+  }
+
+  function renderPlans() {
+    var box = $('plansBox');
+    box.innerHTML = '<p class="hint">加载中…</p>';
+    loadPlans().then(function (data) {
+      var html = '';
+      var board = data.board;
+      if (board) {
+        html += '<p class="hint">正式版图当前修订号 <b>r' + board.revision + '</b>' +
+          (board.locked ? '，状态：<b style="color:var(--danger)">🔒 已锁定</b>（锁定期间不能创建方案或转正式版）'
+                        : '，状态：未锁定') + '</p>';
+      }
+      html += '<div class="btn-row"><button id="btnNewPlan" class="btn primary"' +
+        (!board || board.locked ? ' disabled' : '') + '>＋ 从当前正式版图（r' +
+        (board ? board.revision : '?') + '）新建试排方案</button></div>';
+
+      if (!data.plans.length) {
+        html += '<p class="hint">还没有试排方案。每份方案独立记录来源修订号、自身修订号与各款未排数量；可分别调整布面、缺陷、款式和裁片摆放。</p>';
+      } else {
+        html += data.plans.map(function (p) {
+          var remParts = p.remaining.map(function (g) {
+            var cls = g.remaining > 0 ? 'cl-rem' : 'cl-done';
+            return '<span class="' + cls + '">' + esc(g.name) + ' 未排 ' + g.remaining + '/' + g.required + '</span>';
+          }).join('；');
+          var isOpen = state.ctx === 'plan' && state.planId === p.id;
+          var stale = board && p.sourceRevision !== board.revision;
+          return '<div class="plan-card' + (isOpen ? ' open' : '') + '" data-id="' + esc(p.id) + '">' +
+            '<div class="plan-head"><span class="plan-name">' + esc(p.name) + (isOpen ? '（编辑中）' : '') + '</span>' +
+            '<span class="plan-revs">来源 r' + p.sourceRevision + ' · 方案 r' + p.revision + '</span></div>' +
+            '<div class="plan-rem">未排：' + (remParts || '—') + '</div>' +
+            (stale ? '<div class="plan-stale">⚠ 正式版图已推进到 r' + board.revision + '，此方案不能直接转正式版（可打开另存思路后从新版图重建）</div>' : '') +
+            '<div class="btn-row plan-actions">' +
+            '<button class="btn mini" data-act="open">📝 打开</button>' +
+            '<button class="btn mini" data-act="promote"' + (board && board.locked ? ' disabled' : '') + '>⇪ 转正式版</button>' +
+            '<button class="btn mini" data-act="rename">重命名</button>' +
+            '<button class="btn mini danger-outline" data-act="del">删除</button>' +
+            '</div></div>';
+        }).join('');
+      }
+      box.innerHTML = html;
+
+      var np = $('btnNewPlan');
+      if (np) np.onclick = createPlan;
+      box.querySelectorAll('.plan-card').forEach(function (card) {
+        var id = card.getAttribute('data-id');
+        card.querySelectorAll('button[data-act]').forEach(function (btn) {
+          btn.onclick = function () {
+            var act = btn.getAttribute('data-act');
+            if (act === 'open') doOpenPlan(id);
+            else if (act === 'promote') promotePlan(id);
+            else if (act === 'rename') renamePlan(id);
+            else if (act === 'del') deletePlan(id);
+          };
+        });
+      });
+    }).catch(function (err) { box.textContent = '方案列表加载失败：' + err.message; });
+  }
+
+  function guardDirty() {
+    if (state.dirty && !confirm('当前有未保存改动，继续将放弃这些改动。确定？')) return false;
+    return true;
+  }
+
+  function doOpenPlan(id) {
+    if (!guardDirty()) return;
+    openPlan(id, { fit: true }).then(function () {
+      switchMode('layout');
+      flash('已打开试排方案');
+    });
+  }
+
+  function createPlan() {
+    if (!state.boardInfo) return alert('正式版图尚未就绪');
+    if (state.boardInfo.locked) return alert('正式版图已锁定，不能创建试排方案');
+    var def = '试排方案 ' + new Date().toLocaleString('zh-CN', { hour12: false });
+    var name = prompt('新方案名称', def);
+    if (name === null) return;
+    name = name.trim() || def;
+    api('POST', '/api/plans', { name: name, boardRevision: state.boardInfo.revision }).then(function (r) {
+      if (r.status === 201) {
+        applyPlan(r.d, null);
+        renderChrome();
+        switchMode('layout');
+        fitView();
+        flash('✓ 已从正式版图 r' + r.d.plan.sourceRevision + ' 创建方案「' + r.d.plan.name + '」');
+      } else if (r.status === 409) {
+        alert('创建失败：' + r.d.message);
+        renderPlans();
+      } else if (r.status === 423) {
+        alert('正式版图已锁定，不能创建试排方案');
+        renderPlans();
+      } else {
+        alert('创建方案失败：' + (r.d.message || r.status));
+      }
+    });
+  }
+
+  function renamePlan(id) {
+    var name = prompt('新的方案名称');
+    if (name === null) return;
+    name = name.trim();
+    if (!name) return alert('名称不能为空');
+    api('PATCH', '/api/plans/' + encodeURIComponent(id), { name: name }).then(function (r) {
+      if (r.status === 200) {
+        if (state.ctx === 'plan' && state.planId === id) { state.planName = r.d.plan.name; renderChrome(); }
+        renderPlans();
+      } else alert('重命名失败：' + (r.d.message || r.status));
+    });
+  }
+
+  function deletePlan(id) {
+    if (!confirm('确定删除该试排方案？此操作不影响正式版图与其他方案。')) return;
+    api('DELETE', '/api/plans/' + encodeURIComponent(id)).then(function (r) {
+      if (r.status === 200) {
+        if (state.ctx === 'plan' && state.planId === id) loadBoard().then(fitView);
+        else renderPlans();
+      } else alert('删除失败：' + (r.d.message || r.status));
+    });
+  }
+
+  function promotePlan(id) {
+    var expectedRev;
+    if (state.ctx === 'plan' && state.planId === id) {
+      if (state.dirty) {
+        if (!confirm('方案有未保存改动。先点“保存方案”再转正式版。\n\n是否取消本次操作？')) return;
+        return;
+      }
+      expectedRev = state.revision;
+    } else {
+      expectedRev = Number(prompt('请输入要转正式版的方案修订号（在方案卡片上可见）', '0'));
+      if (!Number.isInteger(expectedRev) || expectedRev < 0) return;
+      if (!guardDirty()) return;
+    }
+    if (!confirm('将此方案切换为正式版图？\n\n条件：方案修订号未过期，且正式版图仍停留在方案来源修订号且未锁定。\n成功后正式版图修订号递增，其他方案保持原样；失败则不产生任何改动。')) return;
+
+    api('POST', '/api/plans/' + encodeURIComponent(id) + '/promote', { revision: expectedRev }).then(function (r) {
+      if (r.status === 200) {
+        applyServerRow(r.d.row);
+        state.revision = r.d.revision;
+        fitView();
+        if (state.mode === 'plans') renderPlans();
+        alert('✓ 已切换为正式版图，新正式版图修订号 r' + r.d.revision + '。其他方案保持原样。');
+      } else if (r.status === 409 || r.status === 423) {
+        // 条件不满足：服务器返回当前版本与原因，不产生部分切换
+        var msg = r.d.message || '条件不满足';
+        if (r.d.current) msg += '\n当前正式版图修订号：r' + r.d.current.revision +
+          (r.d.current.locked ? '（已锁定）' : '（未锁定）');
+        if (r.status === 409 && r.d.error === 'PLAN_REVISION_STALE' && r.d.current) {
+          msg += '\n当前方案修订号：r' + r.d.current.revision;
+        }
+        alert('转正式版被拒：\n' + msg);
+        loadPlans().then(renderPlans);
+        if (state.ctx === 'plan') loadPlanSilently(id);
+      } else if (r.status === 404) {
+        alert('方案不存在或已被删除');
+        renderPlans();
+      } else {
+        alert('转正式版失败：' + (r.d.message || r.status));
+      }
+    });
+  }
+
+  // 方案在别处被改动后，静默刷新当前打开方案（不重置视图）
+  function loadPlanSilently(id) {
+    if (state.ctx !== 'plan' || state.planId !== id) return;
+    openPlan(id, null);
   }
 
   // 本地快速校验（服务端仍会全量复核）
@@ -815,6 +1074,14 @@
   /* ================= 裁切清单 ================= */
   function renderCutlist() {
     var box = $('cutlistBox');
+    if (state.ctx === 'plan') {
+      box.innerHTML = '<p class="hint">当前编辑的是试排方案「' + esc(state.planName || '') +
+        '」，不是正式版图，不能输出正式裁切清单。<br>请先保存方案并用「⇑ 方案」页将其切换为正式版图、再锁定。</p>' +
+        '<div class="btn-row"><button id="btnCutBack" class="btn">↩ 返回正式版图</button></div>';
+      $('btnDownloadCsv').disabled = true;
+      $('btnCutBack').onclick = backToBoard;
+      return;
+    }
     if (!state.locked) {
       box.innerHTML = '<p class="hint">尚未锁定。当前修订号 ' + state.revision + '，锁定后此处显示正式清单，并可下载 CSV。</p>';
       $('btnDownloadCsv').disabled = true;
@@ -845,28 +1112,40 @@
   /* ================= 模式切换 / 顶栏 ================= */
   function switchMode(mode) {
     state.mode = mode;
-    ['Setup', 'Layout', 'Cutlist'].forEach(function (m) {
-      $('tab' + m).classList.toggle('active', m.toLowerCase() === mode);
-      $('panel' + m).classList.toggle('hidden', m.toLowerCase() !== mode);
+    ['Setup', 'Layout', 'Cutlist', 'Plans'].forEach(function (m) {
+      var key = m.toLowerCase();
+      $('tab' + m).classList.toggle('active', key === mode);
+      $('panel' + m).classList.toggle('hidden', key !== mode);
     });
     if (state.draw) cancelDraft();
     if (mode === 'layout') renderSidebar();
     if (mode === 'cutlist') renderCutlist();
+    if (mode === 'plans') renderPlans();
     draw();
   }
 
   function renderChrome() {
-    $('revBadge').textContent = '修订号 ' + (state.revision == null ? '—' : state.revision) + (state.dirty ? '（有未保存改动）' : '');
+    var inPlan = state.ctx === 'plan';
+    $('revBadge').textContent = inPlan
+      ? '📝 方案 r' + (state.revision == null ? '—' : state.revision) +
+        '（来源正式版图 r' + (state.sourceRevision == null ? '—' : state.sourceRevision) + '）' +
+        (state.dirty ? '（有未保存改动）' : '')
+      : '修订号 ' + (state.revision == null ? '—' : state.revision) + (state.dirty ? '（有未保存改动）' : '');
     $('revBadge').classList.toggle('dirty', state.dirty);
-    $('lockBadge').classList.toggle('hidden', !state.locked);
-    $('lockedBanner').classList.toggle('hidden', !state.locked);
-    if (state.locked) $('lockedRev').textContent = state.revision;
-    $('btnSave').disabled = state.locked;
-    $('btnLock').disabled = state.locked;
+    $('lockBadge').classList.toggle('hidden', inPlan || !state.locked);
+    $('planBadge').classList.toggle('hidden', !inPlan);
+    if (inPlan) $('planBadge').textContent = '📝 方案：' + state.planName;
+    $('lockedBanner').classList.toggle('hidden', inPlan || !state.locked);
+    if (state.locked && !inPlan) $('lockedRev').textContent = state.revision;
+    $('btnSave').disabled = !inPlan && state.locked; // 方案始终可保存
+    $('btnSave').textContent = inPlan ? '保存方案' : '保存版图';
+    $('btnLock').classList.toggle('hidden', inPlan);
+    $('btnLock').disabled = !inPlan && state.locked;
+    $('btnBackBoard').classList.toggle('hidden', !inPlan);
     $('saveState').textContent = state.dirty ? '● 未保存' : '已同步';
     $('zoomLabel').textContent = Math.round(state.view.scale / 4 * 100) + '%';
-    // 设置模式下输入框只读
-    var ro = state.locked;
+    // 设置模式下输入框只读：正式版图锁定时只读；方案永远可编辑
+    var ro = !inPlan && state.locked;
     ['fabricW', 'fabricH', 'peName', 'peQty', 'peMargin', 'peAngles'].forEach(function (id) { $(id).disabled = ro; });
     $('btnDrawDefect').disabled = ro; $('btnDrawPiece').disabled = ro; $('btnAddPiece').disabled = ro;
   }
@@ -903,12 +1182,18 @@
   $('tabSetup').onclick = function () { switchMode('setup'); };
   $('tabLayout').onclick = function () { switchMode('layout'); };
   $('tabCutlist').onclick = function () { switchMode('cutlist'); };
+  $('tabPlans').onclick = function () { switchMode('plans'); };
   $('btnReload').onclick = function () {
-    if (state.dirty && !confirm('放弃本地未保存改动并从服务器重新载入？')) return;
-    loadBoard().then(fitView);
+    if (state.dirty && !confirm('放弃当前未保存改动并重新载入？')) return;
+    if (state.ctx === 'plan') {
+      openPlan(state.planId, { fit: true });
+    } else {
+      loadBoard().then(fitView);
+    }
   };
-  $('btnSave').onclick = saveBoard;
+  $('btnSave').onclick = saveCurrent;
   $('btnLock').onclick = lockBoard;
+  $('btnBackBoard').onclick = backToBoard;
   $('btnCloseConflicts').onclick = function () { $('conflictDock').classList.add('hidden'); };
   $('btnDrawDefect').onclick = function () { switchMode('setup'); startDraft('defect'); };
   $('btnCancelDraw').onclick = cancelDraft;

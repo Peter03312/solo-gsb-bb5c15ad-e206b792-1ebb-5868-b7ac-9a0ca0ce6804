@@ -1,11 +1,20 @@
 /*
- * server.js —— Express 服务：静态页面 + 版图 REST API
+ * server.js —— Express 服务：静态页面 + 版图 REST API + 命名试排方案 API
  *
- * 接口：
+ * 正式版图接口（保持兼容）：
  *   GET  /api/board              读取当前版图（含 revision / locked）
  *   PUT  /api/board              提交整稿 {revision, doc}：先全量校验，通过后按修订号原子落库
  *   POST /api/board/lock         锁定版图 {revision}
  *   GET  /api/cutlist?format=csv 已锁定版图的裁切清单（CSV 下载）
+ *
+ * 命名试排方案接口：
+ *   GET    /api/plans                       方案列表（名称、来源修订号、自身修订号、各款未排数量）
+ *   POST   /api/plans                       从未锁定正式版图创建方案 {name, boardRevision}
+ *   GET    /api/plans/:id                   读取单个方案（含完整 doc）
+ *   PUT    /api/plans/:id                   保存方案 {revision, doc}（同套几何/数量/间距校验 + 乐观修订号）
+ *   PATCH  /api/plans/:id                   重命名 {name}
+ *   DELETE /api/plans/:id                   删除方案
+ *   POST   /api/plans/:id/promote           方案转正式版 {revision}：校验方案修订号与来源修订号后原子替换
  */
 'use strict';
 var path = require('path');
@@ -86,6 +95,158 @@ app.post('/api/board/lock', function (req, res) {
     });
   }
   res.json({ ok: true, revision: r.revision, locked: true, row: r.row });
+});
+
+/* ==================== 命名试排方案 ==================== */
+
+function planNameError(name) {
+  if (typeof name !== 'string') return '方案名称 name 必须是字符串';
+  var n = name.trim();
+  if (!n) return '方案名称不能为空';
+  if (n.length > 100) return '方案名称最长 100 个字符';
+  return null;
+}
+
+// 方案列表：名称、来源修订号、自身修订号、各款未排数量
+app.get('/api/plans', function (req, res) {
+  var board = store.get();
+  res.json({
+    board: board ? { revision: board.revision, locked: board.locked, updatedAt: board.updatedAt } : null,
+    plans: store.listPlans()
+  });
+});
+
+// 创建方案：只能从未锁定的正式版图创建，须携带所见正式版图修订号
+app.post('/api/plans', function (req, res) {
+  var body = req.body || {};
+  var name = body.name;
+  if (name === undefined || name === null || name === '') {
+    name = '试排方案 ' + new Date().toLocaleString('zh-CN', { hour12: false });
+  }
+  var ne = planNameError(name);
+  if (ne) return res.status(400).json({ error: 'BAD_PLAN_NAME', message: ne });
+
+  var expected = body.boardRevision;
+  if (typeof expected !== 'number' || !Number.isInteger(expected) || expected < 0) {
+    return res.status(400).json({ error: 'BAD_REVISION', message: '必须携带所见正式版图修订号 boardRevision（非负整数）' });
+  }
+
+  var r = store.createPlan(String(name).trim(), expected);
+  if (r.status === 'not-initialized') {
+    return res.status(404).json({ error: 'NOT_INITIALIZED', message: '版图尚未初始化，请先运行 npm run init-db' });
+  }
+  if (r.status === 'board-locked') {
+    return res.status(423).json({ error: 'BOARD_LOCKED', message: '正式版图已锁定，不能再创建试排方案', current: r.current });
+  }
+  if (r.status === 'board-stale') {
+    return res.status(409).json({
+      error: 'REVISION_STALE',
+      message: '正式版图修订号 ' + expected + ' 已过期，服务器当前为 ' + r.current.revision + '，请刷新后再创建方案',
+      current: r.current
+    });
+  }
+  res.status(201).json({ ok: true, plan: r.plan, board: r.board });
+});
+
+// 读取单个方案（含完整 doc，供打开编辑）
+app.get('/api/plans/:id', function (req, res) {
+  var plan = store.getPlan(req.params.id);
+  if (!plan) return res.status(404).json({ error: 'PLAN_NOT_FOUND', message: '方案不存在：' + req.params.id });
+  var board = store.get();
+  res.json({ plan: plan, board: board ? { revision: board.revision, locked: board.locked } : null });
+});
+
+// 保存方案：沿用正式版图同一套几何/数量/间距校验；携带方案自身修订号
+app.put('/api/plans/:id', function (req, res) {
+  var body = req.body || {};
+  var expected = body.revision;
+  var doc = body.doc;
+  if (typeof expected !== 'number' || !Number.isInteger(expected) || expected < 0) {
+    return res.status(400).json({ error: 'BAD_REVISION', message: '必须携带所见方案修订号 revision（非负整数）' });
+  }
+  if (!doc || typeof doc !== 'object') {
+    return res.status(400).json({ error: 'BAD_DOC', message: '缺少方案数据 doc' });
+  }
+
+  // 1) 与正式版图完全相同的全量校验；失败整份方案不变
+  var result = validator.validateBoard(doc);
+  if (!result.ok) {
+    return res.status(422).json({
+      error: 'VALIDATION_FAILED',
+      message: '校验未通过，整份方案保持原样（共 ' + result.conflicts.length + ' 处冲突）',
+      conflicts: result.conflicts
+    });
+  }
+
+  // 2) 方案自身乐观锁原子写入（正式版图状态不影响方案保存）
+  var saved = store.savePlan(req.params.id, result.doc, expected);
+  if (saved.status === 'not-found') {
+    return res.status(404).json({ error: 'PLAN_NOT_FOUND', message: '方案不存在或已被删除：' + req.params.id });
+  }
+  if (saved.status === 'stale') {
+    return res.status(409).json({
+      error: 'PLAN_REVISION_STALE',
+      message: '方案修订号 ' + expected + ' 已过期，服务器当前为 ' + saved.current.revision +
+        '，请刷新方案后再提交（不会覆盖他人修改）',
+      current: saved.current
+    });
+  }
+  res.json({ ok: true, revision: saved.revision, plan: saved.plan });
+});
+
+// 重命名方案
+app.patch('/api/plans/:id', function (req, res) {
+  var name = (req.body || {}).name;
+  var ne = planNameError(name);
+  if (ne) return res.status(400).json({ error: 'BAD_PLAN_NAME', message: ne });
+  var r = store.renamePlan(req.params.id, String(name).trim());
+  if (r.status === 'not-found') return res.status(404).json({ error: 'PLAN_NOT_FOUND', message: '方案不存在：' + req.params.id });
+  res.json({ ok: true, plan: r.plan });
+});
+
+// 删除方案（不影响正式版图与其他方案）
+app.delete('/api/plans/:id', function (req, res) {
+  var r = store.deletePlan(req.params.id);
+  if (r.status === 'not-found') return res.status(404).json({ error: 'PLAN_NOT_FOUND', message: '方案不存在：' + req.params.id });
+  res.json({ ok: true });
+});
+
+// 方案转正式版：条件不满足时返回当前版本与原因，不产生部分切换
+app.post('/api/plans/:id/promote', function (req, res) {
+  var expected = (req.body || {}).revision;
+  if (typeof expected !== 'number' || !Number.isInteger(expected) || expected < 0) {
+    return res.status(400).json({ error: 'BAD_REVISION', message: '必须携带所见方案修订号 revision（非负整数）' });
+  }
+  var r = store.promotePlan(req.params.id, expected);
+  if (r.status === 'not-initialized') {
+    return res.status(404).json({ error: 'NOT_INITIALIZED', message: '版图尚未初始化' });
+  }
+  if (r.status === 'plan-not-found') {
+    return res.status(404).json({ error: 'PLAN_NOT_FOUND', message: '方案不存在或已被删除：' + req.params.id });
+  }
+  if (r.status === 'board-locked') {
+    return res.status(423).json({ error: 'BOARD_LOCKED', message: '正式版图已锁定，不能用方案替换', current: r.current });
+  }
+  if (r.status === 'plan-stale') {
+    return res.status(409).json({
+      error: 'PLAN_REVISION_STALE',
+      message: '方案修订号 ' + expected + ' 已过期，当前方案修订号为 ' + r.current.revision +
+        '，请打开最新方案后再转正式版',
+      current: r.current,
+      board: r.board
+    });
+  }
+  if (r.status === 'source-moved') {
+    return res.status(409).json({
+      error: 'SOURCE_REVISION_MOVED',
+      message: '正式版图已离开方案来源修订号：方案基于 r' + r.sourceRevision + '，当前正式版图为 r' +
+        r.current.revision + '；为避免覆盖他人修改，拒绝转正式版（可基于当前正式版图新建方案）',
+      sourceRevision: r.sourceRevision,
+      current: r.current
+    });
+  }
+  // 成功：正式版图修订号递增；其他方案保持原样
+  res.json({ ok: true, revision: r.revision, locked: false, row: r.row });
 });
 
 /* ---------- 裁切清单 ---------- */
