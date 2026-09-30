@@ -16,12 +16,16 @@
   </div>
   <div class="rev-info">
     <span id="revBadge" class="badge">修订号 —</span>
+    <span id="schemeBadge" class="badge scheme hidden">🧪 试排方案</span>
     <span id="lockBadge" class="badge lock hidden">🔒 已锁定</span>
     <span id="saveState" class="save-state"></span>
   </div>
   <div class="top-actions">
+    <button id="btnSchemes" class="btn">🧪 方案管理</button>
     <button id="btnReload" class="btn">↻ 重新载入</button>
+    <button id="btnReturnBoard" class="btn hidden">⬅ 返回正式版图</button>
     <button id="btnSave" class="btn primary">保存版图</button>
+    <button id="btnPromote" class="btn primary hidden">⤴ 切换为正式版图</button>
     <button id="btnLock" class="btn danger">锁定版图</button>
   </div>
 </header>
@@ -105,7 +109,7 @@
 
   <!-- ============ 画布 ============ -->
   <main class="canvas-wrap">
-    <div id="lockedBanner" class="locked-banner hidden">🔒 版图已锁定（修订号 <span id="lockedRev"></span>），禁止任何改动；可查看与下载裁切清单。</div>
+    <div id="lockedBanner" class="locked-banner hidden">🔒 正式版图已锁定（修订号 <span id="lockedRev"></span>），禁止任何改动；可查看与下载裁切清单。</div>
     <div id="drawBanner" class="draw-banner hidden"></div>
     <canvas id="canvas"></canvas>
     <div class="canvas-hud">
@@ -127,6 +131,32 @@
     <button id="btnCloseConflicts" class="btn mini">✕</button>
   </div>
   <ul id="conflictList"></ul>
+</div>
+
+<!-- 试排方案管理弹窗 -->
+<div id="schemeModal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <b>🧪 试排方案管理</b>
+      <button id="btnCloseSchemeModal" class="btn mini">✕</button>
+    </div>
+    <p class="hint">排版人员可从<b>未锁定的正式版图</b>克隆多份命名方案，分别调整布面、缺陷、款式与裁片摆放。
+      每份方案固定记录<b>来源正式版图修订号</b>与<b>自身修订号</b>；保存沿用同一套几何/数量/间距校验。
+      「切换为正式版图」要求方案修订号未过期、正式版图仍处于来源修订号且未锁定——成功后正式版图修订号递增，其他方案保持原样。</p>
+    <div class="scheme-create">
+      <input id="newSchemeName" type="text" maxlength="80" placeholder="新方案名称，如：试排 A-省料">
+      <button id="btnCreateScheme" class="btn primary">＋ 从当前正式版图创建方案</button>
+    </div>
+    <p id="schemeBoardInfo" class="hint"></p>
+    <div class="table-wrap">
+      <table id="schemeTable">
+        <thead><tr>
+          <th>名称</th><th>来源修订号</th><th>方案修订号</th><th>各款未排数量</th><th class="col-op">操作</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <script src="/shared/geom.js"></script>
